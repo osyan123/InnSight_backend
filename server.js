@@ -5,11 +5,13 @@ const cors = require("cors");
 const axios = require("axios");
 const admin = require("firebase-admin");
 
-if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-  throw new Error("Missing FIREBASE_SERVICE_ACCOUNT environment variable");
-}
+let serviceAccount;
 
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} else {
+  serviceAccount = require("./serviceAccountKey.json");
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -23,6 +25,10 @@ app.use(cors());
 app.use(express.json({limit: "10mb"}));
 
 const PAYMONGO_SECRET_KEY = process.env.PAYMONGO_SECRET_KEY;
+
+if (!PAYMONGO_SECRET_KEY) {
+  throw new Error("Missing PAYMONGO_SECRET_KEY environment variable");
+}
 
 function paymongoHeaders() {
   return {
@@ -148,8 +154,9 @@ app.post("/create-qr-payment", async (req, res) => {
 
 app.post("/paymongo-webhook", async (req, res) => {
   try {
-    console.log(" WEBHOOK HIT");
-    console.log(" BODY:", JSON.stringify(req.body, null, 2));
+    console.log("========== WEBHOOK HIT ==========");
+    console.log(JSON.stringify(req.body, null, 2));
+    console.log("================================");
 
     const eventPayload = req.body.data || {};
     const eventAttributes = eventPayload.attributes || {};
@@ -169,40 +176,29 @@ app.post("/paymongo-webhook", async (req, res) => {
       resourceAttributes = eventPayload.attributes || null;
     }
 
-    console.log(" eventType:", eventType);
+    console.log("eventType:", eventType);
     console.log(
         "resourceAttributes:",
         JSON.stringify(resourceAttributes, null, 2),
     );
 
     if (!resourceAttributes) {
-      console.log(" No resourceAttributes found");
+      console.log("No resourceAttributes found");
       return res.status(200).json({received: true, ignored: true});
     }
 
-    const metadata = resourceAttributes.metadata || {};
-    const hotelId = metadata.hotelId;
-    const bookingId = metadata.bookingId;
-    const paymentId = metadata.paymentId;
-
-    console.log(" metadata:", metadata);
-    console.log(" parsed ids:", {hotelId, bookingId, paymentId});
-
-    if (!hotelId || !bookingId || !paymentId) {
-      console.log(" Missing metadata IDs");
-      return res.status(200).json({received: true, ignored: true});
-    }
+    let metadata = resourceAttributes.metadata || {};
+    let hotelId = metadata.hotelId || null;
+    let bookingId = metadata.bookingId || null;
+    let paymentId = metadata.paymentId || null;
 
     const status = (resourceAttributes.status || "").toLowerCase();
-    console.log(" status:", status);
-
     const amount =
       typeof resourceAttributes.amount === "number" ?
       resourceAttributes.amount / 100 :
       null;
 
     let reference = null;
-
     if (
       Array.isArray(resourceAttributes.payments) &&
       resourceAttributes.payments.length > 0 &&
@@ -214,18 +210,87 @@ app.post("/paymongo-webhook", async (req, res) => {
       reference = resourceData.id;
     }
 
+    let paymentIntentId = null;
+
+    if (resourceAttributes.payment_intent_id) {
+      paymentIntentId = resourceAttributes.payment_intent_id;
+    } else if (
+      resourceAttributes.payment_intent &&
+      typeof resourceAttributes.payment_intent === "object"
+    ) {
+      paymentIntentId = resourceAttributes.payment_intent.id || null;
+    } else if (
+      resourceAttributes.source &&
+      typeof resourceAttributes.source === "object"
+    ) {
+      paymentIntentId = resourceAttributes.source.id || null;
+    } else if (
+      resourceAttributes.payments &&
+      Array.isArray(resourceAttributes.payments) &&
+      resourceAttributes.payments.length > 0 &&
+      resourceAttributes.payments[0] &&
+      resourceAttributes.payments[0].attributes &&
+      resourceAttributes.payments[0].attributes.payment_intent_id
+    ) {
+      paymentIntentId =
+        resourceAttributes.payments[0].attributes.payment_intent_id;
+    } else if (resourceData && resourceData.id) {
+      paymentIntentId = resourceData.id;
+    }
+
+    console.log("metadata:", metadata);
+    console.log("parsed ids:", {hotelId, bookingId, paymentId});
+    console.log("status:", status);
+    console.log("paymentIntentId:", paymentIntentId);
+    console.log("reference:", reference);
+
+    if (!hotelId || !bookingId || !paymentId) {
+      console.log(
+          "Metadata incomplete. Trying lookup by paymongoPaymentIntentId...",
+      );
+
+      if (paymentIntentId) {
+        const cg = await db
+            .collectionGroup("payments")
+            .where("paymongoPaymentIntentId", "==", paymentIntentId)
+            .limit(1)
+            .get();
+
+        if (!cg.empty) {
+          const doc = cg.docs[0];
+          const path = doc.ref.path.split("/");
+
+          if (path.length >= 6) {
+            hotelId = path[1];
+            bookingId = path[3];
+            paymentId = path[5];
+          }
+
+          console.log("Resolved payment doc via collectionGroup:", {
+            hotelId,
+            bookingId,
+            paymentId,
+            path: doc.ref.path,
+          });
+        }
+      }
+    }
+
+    if (!hotelId || !bookingId || !paymentId) {
+      console.log("Still missing IDs after lookup");
+      return res.status(200).json({received: true, ignored: true});
+    }
+
     const isSucceeded =
       status === "succeeded" ||
       status === "paid" ||
       eventType === "payment.paid" ||
-      eventType === "payment_intent.succeeded" ||
-      eventType === "source.chargeable" ||
-      eventType === "payment_intent.payment_attempted";
+      eventType === "payment_intent.succeeded";
 
-    console.log("🔥 isSucceeded:", isSucceeded);
+    console.log("isSucceeded:", isSucceeded);
 
     if (!isSucceeded) {
-      console.log("❌ Not a success event");
+      console.log("Not a success event");
       return res.status(200).json({
         received: true,
         ignored: true,
@@ -234,46 +299,46 @@ app.post("/paymongo-webhook", async (req, res) => {
       });
     }
 
-    console.log(" about to save paid payment", {
-      eventType,
-      status,
-      hotelId,
-      bookingId,
-      paymentId,
-      amount,
-      reference,
-    });
-
-    await db
+    const paymentRef = db
         .collection("hotels")
         .doc(hotelId)
         .collection("bookings")
         .doc(bookingId)
         .collection("payments")
-        .doc(paymentId)
-        .set(
-            {
-              paymentId,
-              method: "qrph",
-              status: "paid",
-              amountExpected: amount,
-              amountPaid: amount,
-              reference,
-              paymongoPaymentIntentId:
-              resourceData && resourceData.id ? resourceData.id : null,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              paidAt: admin.firestore.FieldValue.serverTimestamp(),
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            {merge: true},
-        );
+        .doc(paymentId);
 
-    console.log("Firestore payment doc saved");
+    console.log("=== WEBHOOK SAVE ===");
+    console.log("hotelId:", hotelId);
+    console.log("bookingId:", bookingId);
+    console.log("paymentId:", paymentId);
+    console.log(
+        `hotels/${hotelId}/bookings/${bookingId}/payments/${paymentId}`,
+    );
+    console.log("====================");
+
+    await paymentRef.set(
+        {
+          paymentId,
+          method: "online",
+          status: "paid",
+          amountExpected: amount,
+          amountPaid: amount,
+          amountReceived: amount,
+          change: 0,
+          reference,
+          paymongoPaymentIntentId: paymentIntentId,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        {merge: true},
+    );
+
+    console.log("Firestore payment doc saved successfully");
 
     return res.status(200).json({received: true, saved: true});
   } catch (error) {
     console.error(
-        " WEBHOOK ERROR:",
+        "WEBHOOK ERROR:",
         error.response ?
         JSON.stringify(error.response.data, null, 2) :
         error.message,
@@ -286,4 +351,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
