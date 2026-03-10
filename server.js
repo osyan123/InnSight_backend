@@ -187,31 +187,30 @@ app.post("/paymongo-webhook", async (req, res) => {
     console.log(JSON.stringify(req.body, null, 2));
     console.log("================================");
 
-    const data = req.body.data || {};
-    const attributes = data.attributes || {};
-    const metadata = attributes.metadata || {};
+    const eventData = req.body.data || {};
+    const eventAttributes = eventData.attributes || {};
+    const eventType = (eventAttributes.type || "").toLowerCase();
+
+    const resourceData = eventAttributes.data || {};
+    const resourceAttributes = resourceData.attributes || {};
+
+    const metadata = resourceAttributes.metadata || {};
 
     const hotelId = metadata.hotelId;
     const bookingId = metadata.bookingId;
     const paymentId = metadata.paymentId;
 
-    const status = (attributes.status || "").toLowerCase();
-    const eventType = (req.body.data?.attributes?.type || "").toLowerCase();
+    const status = (resourceAttributes.status || "").toLowerCase();
 
     const amount =
-      typeof attributes.amount === "number" ?
-        attributes.amount / 100 :
+      typeof resourceAttributes.amount === "number" ?
+        resourceAttributes.amount / 100 :
         null;
 
     let reference = null;
 
-    if (
-      attributes.payments &&
-      Array.isArray(attributes.payments) &&
-      attributes.payments.length > 0 &&
-      attributes.payments[0].id
-    ) {
-      reference = attributes.payments[0].id;
+    if (resourceData.id) {
+      reference = resourceData.id;
     }
 
     console.log("METADATA:");
