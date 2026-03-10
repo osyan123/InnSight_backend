@@ -18,7 +18,6 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
-
 const app = express();
 
 app.use(cors());
@@ -60,74 +59,104 @@ app.post("/create-qr-payment", async (req, res) => {
     const amountInCentavos = Math.round(Number(amount) * 100);
 
     const paymentIntentResponse = await axios.post(
-        "https://api.paymongo.com/v1/payment_intents",
-        {
-          data: {
-            attributes: {
-              amount: amountInCentavos,
-              currency: "PHP",
-              capture_type: "automatic",
-              payment_method_allowed: ["qrph"],
-              metadata: {
-                hotelId,
-                bookingId,
-                paymentId,
-              },
+      "https://api.paymongo.com/v1/payment_intents",
+      {
+        data: {
+          attributes: {
+            amount: amountInCentavos,
+            currency: "PHP",
+            capture_type: "automatic",
+            payment_method_allowed: ["qrph"],
+            metadata: {
+              hotelId,
+              bookingId,
+              paymentId,
             },
           },
         },
-        {
-          headers: paymongoHeaders(),
-        },
+      },
+      {
+        headers: paymongoHeaders(),
+      },
     );
 
     const paymentIntentId = paymentIntentResponse.data.data.id;
 
     const paymentMethodResponse = await axios.post(
-        "https://api.paymongo.com/v1/payment_methods",
-        {
-          data: {
-            attributes: {
-              type: "qrph",
-              billing: {
-                name: "InnSight Guest",
-                email: "guest@example.com",
-              },
+      "https://api.paymongo.com/v1/payment_methods",
+      {
+        data: {
+          attributes: {
+            type: "qrph",
+            billing: {
+              name: "InnSight Guest",
+              email: "guest@example.com",
             },
           },
         },
-        {
-          headers: paymongoHeaders(),
-        },
+      },
+      {
+        headers: paymongoHeaders(),
+      },
     );
 
     const paymentMethodId = paymentMethodResponse.data.data.id;
 
     const attachResponse = await axios.post(
-        `https://api.paymongo.com/v1/payment_intents/${paymentIntentId}/attach`,
-        {
-          data: {
-            attributes: {
-              payment_method: paymentMethodId,
-            },
+      `https://api.paymongo.com/v1/payment_intents/${paymentIntentId}/attach`,
+      {
+        data: {
+          attributes: {
+            payment_method: paymentMethodId,
           },
         },
-        {
-          headers: paymongoHeaders(),
-        },
+      },
+      {
+        headers: paymongoHeaders(),
+      },
     );
 
     console.log(
-        "ATTACH RESPONSE FULL:",
-        JSON.stringify(attachResponse.data, null, 2),
+      "ATTACH RESPONSE FULL:",
+      JSON.stringify(attachResponse.data, null, 2),
     );
 
     const attributes = attachResponse.data.data.attributes || {};
     const nextAction = attributes.next_action || {};
     const qrImageUrl =
       nextAction.code && nextAction.code.image_url ?
-      nextAction.code.image_url :
-      "";
+        nextAction.code.image_url :
+        "";
+
+    const paymentRef = db
+      .collection("hotels")
+      .doc(hotelId)
+      .collection("bookings")
+      .doc(bookingId)
+      .collection("payments")
+      .doc(paymentId);
+
+    await paymentRef.set(
+      {
+        paymentId,
+        bookingId,
+        hotelId,
+        method: "online",
+        status: "pending",
+        amountExpected: Number(amount),
+        amountPaid: 0,
+        amountReceived: 0,
+        change: 0,
+        reference: null,
+        paymongoPaymentIntentId: paymentIntentId,
+        paymongoPaymentMethodId: paymentMethodId,
+        paymentIntentStatus: attributes.status || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      {merge: true},
+    );
+
+    console.log("CREATE QR DOC PATH:", paymentRef.path);
 
     return res.status(200).json({
       qrImageUrl,
@@ -139,8 +168,8 @@ app.post("/create-qr-payment", async (req, res) => {
     });
   } catch (error) {
     console.error(
-        "create-qr-payment error:",
-        error.response ?
+      "create-qr-payment error:",
+      error.response ?
         JSON.stringify(error.response.data, null, 2) :
         error.message,
     );
@@ -178,8 +207,8 @@ app.post("/paymongo-webhook", async (req, res) => {
 
     console.log("eventType:", eventType);
     console.log(
-        "resourceAttributes:",
-        JSON.stringify(resourceAttributes, null, 2),
+      "resourceAttributes:",
+      JSON.stringify(resourceAttributes, null, 2),
     );
 
     if (!resourceAttributes) {
@@ -187,18 +216,21 @@ app.post("/paymongo-webhook", async (req, res) => {
       return res.status(200).json({received: true, ignored: true});
     }
 
-    let metadata = resourceAttributes.metadata || {};
+    const metadata = resourceAttributes.metadata || {};
+
     let hotelId = metadata.hotelId || null;
     let bookingId = metadata.bookingId || null;
     let paymentId = metadata.paymentId || null;
 
     const status = (resourceAttributes.status || "").toLowerCase();
+
     const amount =
       typeof resourceAttributes.amount === "number" ?
-      resourceAttributes.amount / 100 :
-      null;
+        resourceAttributes.amount / 100 :
+        null;
 
     let reference = null;
+
     if (
       Array.isArray(resourceAttributes.payments) &&
       resourceAttributes.payments.length > 0 &&
@@ -244,43 +276,6 @@ app.post("/paymongo-webhook", async (req, res) => {
     console.log("paymentIntentId:", paymentIntentId);
     console.log("reference:", reference);
 
-    if (!hotelId || !bookingId || !paymentId) {
-      console.log(
-          "Metadata incomplete. Trying lookup by paymongoPaymentIntentId...",
-      );
-
-      if (paymentIntentId) {
-        const cg = await db
-            .collectionGroup("payments")
-            .where("paymongoPaymentIntentId", "==", paymentIntentId)
-            .limit(1)
-            .get();
-
-        if (!cg.empty) {
-          const doc = cg.docs[0];
-          const path = doc.ref.path.split("/");
-
-          if (path.length >= 6) {
-            hotelId = path[1];
-            bookingId = path[3];
-            paymentId = path[5];
-          }
-
-          console.log("Resolved payment doc via collectionGroup:", {
-            hotelId,
-            bookingId,
-            paymentId,
-            path: doc.ref.path,
-          });
-        }
-      }
-    }
-
-    if (!hotelId || !bookingId || !paymentId) {
-      console.log("Still missing IDs after lookup");
-      return res.status(200).json({received: true, ignored: true});
-    }
-
     const isSucceeded =
       status === "succeeded" ||
       status === "paid" ||
@@ -299,7 +294,10 @@ app.post("/paymongo-webhook", async (req, res) => {
       });
     }
 
-    const paymentRef = db
+    let paymentRef = null;
+
+    if (hotelId && bookingId && paymentId) {
+      paymentRef = db
         .collection("hotels")
         .doc(hotelId)
         .collection("bookings")
@@ -307,39 +305,103 @@ app.post("/paymongo-webhook", async (req, res) => {
         .collection("payments")
         .doc(paymentId);
 
-    console.log("=== WEBHOOK SAVE ===");
-    console.log("hotelId:", hotelId);
-    console.log("bookingId:", bookingId);
-    console.log("paymentId:", paymentId);
-    console.log(
-        `hotels/${hotelId}/bookings/${bookingId}/payments/${paymentId}`,
-    );
-    console.log("====================");
+      const directSnap = await paymentRef.get();
+
+      if (!directSnap.exists) {
+        console.log("Direct metadata path not found. Will fallback lookup.");
+        paymentRef = null;
+      }
+    }
+
+    if (!paymentRef && paymentIntentId) {
+      console.log("Trying restricted fallback lookup...");
+
+      let query = db
+        .collectionGroup("payments")
+        .where("paymongoPaymentIntentId", "==", paymentIntentId)
+        .limit(10);
+
+      const cg = await query.get();
+
+      if (!cg.empty) {
+        let matchedDoc = null;
+
+        for (const doc of cg.docs) {
+          const data = doc.data() || {};
+          const path = doc.ref.path.split("/");
+
+          const docHotelId = path.length >= 6 ? path[1] : null;
+          const docBookingId = path.length >= 6 ? path[3] : null;
+          const docPaymentId = path.length >= 6 ? path[5] : null;
+
+          const hotelMatches = !hotelId || hotelId === docHotelId;
+          const bookingMatches = !bookingId || bookingId === docBookingId;
+          const paymentMatches = !paymentId || paymentId === docPaymentId;
+
+          if (hotelMatches && bookingMatches && paymentMatches) {
+            matchedDoc = doc;
+            break;
+          }
+        }
+
+        if (!matchedDoc) {
+          matchedDoc = cg.docs[0];
+        }
+
+        const path = matchedDoc.ref.path.split("/");
+
+        hotelId = path.length >= 6 ? path[1] : hotelId;
+        bookingId = path.length >= 6 ? path[3] : bookingId;
+        paymentId = path.length >= 6 ? path[5] : paymentId;
+        paymentRef = matchedDoc.ref;
+
+        console.log("Resolved payment doc via fallback:", {
+          hotelId,
+          bookingId,
+          paymentId,
+          path: matchedDoc.ref.path,
+        });
+      }
+    }
+
+    if (!paymentRef) {
+      console.log("No exact payment document resolved");
+      return res.status(200).json({received: true, ignored: true});
+    }
+
+    console.log("WEBHOOK SAVING DOC PATH:", paymentRef.path);
+    console.log("WEBHOOK hotelId:", hotelId);
+    console.log("WEBHOOK bookingId:", bookingId);
+    console.log("WEBHOOK paymentId:", paymentId);
+    console.log("WEBHOOK status to save: paid");
 
     await paymentRef.set(
-        {
-          paymentId,
-          method: "online",
-          status: "paid",
-          amountExpected: amount,
-          amountPaid: amount,
-          amountReceived: amount,
-          change: 0,
-          reference,
-          paymongoPaymentIntentId: paymentIntentId,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          paidAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        {merge: true},
+      {
+        paymentId,
+        bookingId,
+        hotelId,
+        method: "online",
+        status: "paid",
+        amountExpected: amount,
+        amountPaid: amount,
+        amountReceived: amount,
+        change: 0,
+        reference,
+        paymongoPaymentIntentId: paymentIntentId,
+        paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      {merge: true},
     );
 
-    console.log("Firestore payment doc saved successfully");
+    const savedSnap = await paymentRef.get();
+    console.log("WEBHOOK SAVED DATA:", savedSnap.data());
 
     return res.status(200).json({received: true, saved: true});
   } catch (error) {
     console.error(
-        "WEBHOOK ERROR:",
-        error.response ?
+      "WEBHOOK ERROR:",
+      error.response ?
         JSON.stringify(error.response.data, null, 2) :
         error.message,
     );
@@ -350,4 +412,4 @@ app.post("/paymongo-webhook", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-});
+}); 
