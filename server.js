@@ -4,7 +4,13 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const admin = require("firebase-admin");
+
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  throw new Error("Missing FIREBASE_SERVICE_ACCOUNT environment variable");
+}
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
@@ -280,3 +286,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
